@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "deterministic_sql"
-requires-python = ">=3.8"
+requires-python = ">=3.7"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -13,6 +13,5 @@ classifiers = [
 dynamic = ["version"]
 
 [tool.maturin]
-bindings = "cffi"
 compatibility = "linux"
 features = ["pyo3/extension-module"]
