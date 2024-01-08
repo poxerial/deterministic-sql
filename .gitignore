@@ -2,3 +2,5 @@ target*
 
 .*
 !.gitignore
+!.env/pyvenv.cfg
+!.github

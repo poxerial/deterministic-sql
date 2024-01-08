@@ -1,11 +1,19 @@
 use core::ops::ControlFlow;
-use sqlparser::ast::{
-    Expr, OrderByExpr, Query, SelectItem, SetExpr, Statement, Value, VisitMut, VisitorMut,
-};
+use sqlparser::ast::*;
 use sqlparser::dialect::AnsiDialect;
 use sqlparser::parser::Parser;
 
 use pyo3::prelude::*;
+
+const DATE_COLUMN_NAMES: [&'static str; 3] = ["date", "p_date", "pdate"];
+const ARRAY_AGG_FUNCS: [&'static str; 5] = [
+    "array_agg",
+    "set_agg",
+    "collect_set",
+    "collect_list",
+    "array_set",
+];
+const ARRAY_SORT: &'static str = "array_sort";
 
 struct Formalizer {
     broken: bool,
@@ -71,6 +79,74 @@ fn need_to_add_limit(limit: &Option<Expr>) -> bool {
     }
 }
 
+fn formalize_function(func: &mut Function) {
+    if func.name.0.len() != 1 || func.args.len() != 1 {
+        return;
+    }
+    let mut name_matched = false;
+    ARRAY_AGG_FUNCS.into_iter().for_each(|array_agg_func| {
+        if func.name.0[0].value == array_agg_func {
+            name_matched = true;
+        }
+    });
+    if !name_matched {
+        return;
+    }
+
+    func.args[0] = FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Function(func.clone())));
+    func.name.0[0].value.clear();
+    func.name.0[0].value.push_str(ARRAY_SORT);
+}
+
+fn formalize_binop(left: &Box<Expr>, op: &mut BinaryOperator, right: &Box<Expr>) {
+    match op {
+        BinaryOperator::Gt => (),
+        BinaryOperator::GtEq => (),
+        BinaryOperator::Lt => (),
+        BinaryOperator::LtEq => (),
+        _ => return,
+    }
+    match left.as_ref() {
+        Expr::Identifier(ident) => {
+            let mut name_matched = false;
+            DATE_COLUMN_NAMES.into_iter().for_each(|s| {
+                if s == ident.value {
+                    name_matched = true;
+                }
+            });
+            if !name_matched {
+                return;
+            }
+            match op {
+                BinaryOperator::Gt => *op = BinaryOperator::Eq,
+                BinaryOperator::GtEq => *op = BinaryOperator::Eq,
+                _ => (),
+            }
+            return;
+        }
+        _ => (),
+    }
+    match right.as_ref() {
+        Expr::Identifier(ident) => {
+            let mut name_matched = false;
+            DATE_COLUMN_NAMES.into_iter().for_each(|s| {
+                if s == ident.value {
+                    name_matched = true;
+                }
+            });
+            if !name_matched {
+                return;
+            }
+            match op {
+                BinaryOperator::Lt => *op = BinaryOperator::Eq,
+                BinaryOperator::LtEq => *op = BinaryOperator::Eq,
+                _ => (),
+            }
+        }
+        _ => (),
+    }
+}
+
 impl VisitorMut for Formalizer {
     type Break = ();
 
@@ -112,6 +188,15 @@ impl VisitorMut for Formalizer {
             },
             _ => ControlFlow::Continue(()),
         }
+    }
+
+    fn post_visit_expr(&mut self, _expr: &mut Expr) -> ControlFlow<Self::Break> {
+        match _expr {
+            Expr::BinaryOp { left, op, right } => formalize_binop(left, op, right),
+            Expr::Function(function) => formalize_function(function),
+            _ => (),
+        };
+        ControlFlow::Continue(())
     }
 }
 
@@ -211,6 +296,44 @@ mod tests {
         assert_eq!(
             make_deterministic(sql),
             "SELECT orders.order_id, orders.order_amount, customers.customer_name FROM orders JOIN (SELECT customer_id, customer_name FROM customers ORDER BY 1, 2 LIMIT 20000) AS customers ON orders.customer_id = customers.customer_id ORDER BY 1, 2, 3 LIMIT 20000"
+        );
+    }
+
+    #[test]
+    fn formalize_partition() {
+        let sql = "SELECT a FROM t WHERE date >= '20240101'";
+        assert_eq!(
+            make_deterministic(sql),
+            "SELECT a FROM t WHERE date = '20240101' ORDER BY 1 LIMIT 20000"
+        );
+        let sql = "SELECT a FROM t WHERE date > '20240101'";
+        assert_eq!(
+            make_deterministic(sql),
+            "SELECT a FROM t WHERE date = '20240101' ORDER BY 1 LIMIT 20000"
+        );
+        let sql = "SELECT a FROM t WHERE '20240101' <= date";
+        assert_eq!(
+            make_deterministic(sql),
+            "SELECT a FROM t WHERE '20240101' = date ORDER BY 1 LIMIT 20000"
+        );
+        let sql = "SELECT a FROM t WHERE '20240101' < date";
+        assert_eq!(
+            make_deterministic(sql),
+            "SELECT a FROM t WHERE '20240101' = date ORDER BY 1 LIMIT 20000"
+        );
+        let sql = "SELECT a FROM t WHERE name = 'Tom' AND date >= '20240101'";
+        assert_eq!(
+            make_deterministic(sql),
+            "SELECT a FROM t WHERE name = 'Tom' AND date = '20240101' ORDER BY 1 LIMIT 20000"
+        );
+    }
+
+    #[test]
+    fn array_sort() {
+        let sql = "SELECT set_agg(a) FROM t";
+        assert_eq!(
+            make_deterministic(sql),
+            "SELECT array_sort(set_agg(a)) FROM t ORDER BY 1 LIMIT 20000"
         );
     }
 }
