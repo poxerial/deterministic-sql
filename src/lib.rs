@@ -16,12 +16,97 @@ const ARRAY_AGG_FUNCS: [&'static str; 5] = [
 const ARRAY_SORT: &'static str = "array_sort";
 
 struct Formalizer {
-    broken: bool,
+    has_wild: bool,
+    is_outermost: bool,
+    output_columns: usize,
 }
 
 impl Formalizer {
+    pub fn new(output_columns: usize) -> Self {
+        let has_wild = false;
+        let is_outermost = true;
+        Self {
+            has_wild,
+            is_outermost,
+            output_columns,
+        }
+    }
+
     pub fn is_broken(&self) -> bool {
-        self.broken
+        self.has_wild
+    }
+
+    pub fn pre_visit_outermost_query(&mut self, query: &mut Query) {
+        let body = query.body.as_ref();
+        match body {
+            SetExpr::Select(_) => {
+                query.order_by = construct_order_by(self.output_columns);
+                if need_to_add_limit(&query.limit) {
+                    query.limit = Some(Expr::Value(Value::Number(String::from("20000"), false)));
+                }
+                query.limit_by = vec![];
+            }
+            SetExpr::SetOperation {
+                left,
+                op: _,
+                set_quantifier: _,
+                right: _,
+            } => match left.as_ref() {
+                SetExpr::Select(_) => {
+                    query.order_by = construct_order_by(self.output_columns);
+                    if need_to_add_limit(&query.limit) {
+                        query.limit =
+                            Some(Expr::Value(Value::Number(String::from("20000"), false)));
+                    }
+                    query.limit_by = vec![];
+                }
+                _ => (),
+            },
+            _ => (),
+        }
+    }
+
+    pub fn pre_visit_inner_query(&mut self, query: &mut Query) -> bool {
+        if query.limit.is_none() {
+            return true;
+        }
+        let body = query.body.as_ref();
+        match body {
+            SetExpr::Select(select) => {
+                if !no_wild(&select.projection) {
+                    self.has_wild = true;
+                    return false;
+                }
+                query.order_by = construct_order_by(select.projection.len());
+                if need_to_add_limit(&query.limit) {
+                    query.limit = Some(Expr::Value(Value::Number(String::from("20000"), false)));
+                }
+                query.limit_by = vec![];
+                true
+            }
+            SetExpr::SetOperation {
+                left,
+                op: _,
+                set_quantifier: _,
+                right: _,
+            } => match left.as_ref() {
+                SetExpr::Select(select) => {
+                    if !no_wild(&select.projection) {
+                        self.has_wild = true;
+                        return false;
+                    }
+                    query.order_by = construct_order_by(select.projection.len());
+                    if need_to_add_limit(&query.limit) {
+                        query.limit =
+                            Some(Expr::Value(Value::Number(String::from("20000"), false)));
+                    }
+                    query.limit_by = vec![];
+                    true
+                }
+                _ => true,
+            },
+            _ => true,
+        }
     }
 }
 
@@ -151,42 +236,16 @@ impl VisitorMut for Formalizer {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        let body = query.body.as_ref();
-        match body {
-            SetExpr::Select(select) => {
-                if !no_wild(&select.projection) {
-                    self.broken = true;
-                    return ControlFlow::Break(());
-                }
-                query.order_by = construct_order_by(select.projection.len());
-                if need_to_add_limit(&query.limit) {
-                    query.limit = Some(Expr::Value(Value::Number(String::from("20000"), false)));
-                }
-                query.limit_by = vec![];
+        if self.is_outermost {
+            self.pre_visit_outermost_query(query);
+            self.is_outermost = false;
+            ControlFlow::Continue(())
+        } else {
+            if self.pre_visit_inner_query(query) {
                 ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
             }
-            SetExpr::SetOperation {
-                left,
-                op: _,
-                set_quantifier: _,
-                right: _,
-            } => match left.as_ref() {
-                SetExpr::Select(select) => {
-                    if !no_wild(&select.projection) {
-                        self.broken = true;
-                        return ControlFlow::Break(());
-                    }
-                    query.order_by = construct_order_by(select.projection.len());
-                    if need_to_add_limit(&query.limit) {
-                        query.limit =
-                            Some(Expr::Value(Value::Number(String::from("20000"), false)));
-                    }
-                    query.limit_by = vec![];
-                    ControlFlow::Continue(())
-                }
-                _ => ControlFlow::Continue(()),
-            },
-            _ => ControlFlow::Continue(()),
         }
     }
 
@@ -200,7 +259,7 @@ impl VisitorMut for Formalizer {
     }
 }
 
-fn make_deterministic(sql: &str) -> String {
+fn make_deterministic(sql: &str, output_columns: usize) -> String {
     let result = Parser::parse_sql(&AnsiDialect {}, sql);
     match result {
         Ok(mut statements) => {
@@ -208,15 +267,15 @@ fn make_deterministic(sql: &str) -> String {
                 "".to_owned()
             } else {
                 let mut first_statement = &mut statements[0];
-                make_deterministic_impl(&mut first_statement)
+                make_deterministic_impl(&mut first_statement, output_columns)
             }
         }
         Err(_) => "".to_owned(),
     }
 }
 
-fn make_deterministic_impl(statement: &mut Statement) -> String {
-    let mut visitor = Formalizer { broken: false };
+fn make_deterministic_impl(statement: &mut Statement, output_columns: usize) -> String {
+    let mut visitor = Formalizer::new(output_columns);
     statement.visit(&mut visitor);
     if visitor.is_broken() {
         String::from("")
@@ -226,10 +285,10 @@ fn make_deterministic_impl(statement: &mut Statement) -> String {
 }
 
 #[pyfunction]
-#[pyo3(text_signature = "(sql)")]
+#[pyo3(text_signature = "(sql, output_columns)")]
 #[pyo3(name = "make_deterministic")]
-fn python_wrapper(sql: &str) -> PyResult<String> {
-    Ok(make_deterministic(sql))
+fn python_wrapper(sql: &str, output_columns: usize) -> PyResult<String> {
+    Ok(make_deterministic(sql, output_columns))
 }
 
 #[pymodule]
@@ -246,7 +305,7 @@ mod tests {
     fn simple() {
         let sql = "select a, b, c from t";
         assert_eq!(
-            make_deterministic(sql),
+            make_deterministic(sql, 3),
             "SELECT a, b, c FROM t ORDER BY 1, 2, 3 LIMIT 20000"
         );
     }
@@ -255,7 +314,19 @@ mod tests {
     fn nested() {
         let sql = "select a, b, c from (select a, b, c from t)";
         assert_eq!(
-            make_deterministic(sql),
+            make_deterministic(sql, 3),
+            "SELECT a, b, c FROM (SELECT a, b, c FROM t) ORDER BY 1, 2, 3 LIMIT 20000"
+        );
+
+        let sql = "select a, b, c from (select a, b, c from t limit 10)";
+        assert_eq!(
+            make_deterministic(sql, 3),
+            "SELECT a, b, c FROM (SELECT a, b, c FROM t ORDER BY 1, 2, 3 LIMIT 10) ORDER BY 1, 2, 3 LIMIT 20000"
+        );
+
+        let sql = "select a, b, c from (select a, b, c from t limit 100000)";
+        assert_eq!(
+            make_deterministic(sql, 3),
             "SELECT a, b, c FROM (SELECT a, b, c FROM t ORDER BY 1, 2, 3 LIMIT 20000) ORDER BY 1, 2, 3 LIMIT 20000"
         );
     }
@@ -264,7 +335,7 @@ mod tests {
     fn limit() {
         let sql = "select a, b, c from t limit 10";
         assert_eq!(
-            make_deterministic(sql),
+            make_deterministic(sql, 3),
             "SELECT a, b, c FROM t ORDER BY 1, 2, 3 LIMIT 10"
         );
     }
@@ -272,14 +343,17 @@ mod tests {
     #[test]
     fn wild() {
         let sql = "select * from t limit 10";
-        assert_eq!(make_deterministic(sql), "");
+        assert_eq!(
+            make_deterministic(sql, 1),
+            "SELECT * FROM t ORDER BY 1 LIMIT 10"
+        );
     }
 
     #[test]
     fn union() {
         let sql = "select a from t1 union all select b from t2";
         assert_eq!(
-            make_deterministic(sql),
+            make_deterministic(sql, 1),
             "SELECT a FROM t1 UNION ALL SELECT b FROM t2 ORDER BY 1 LIMIT 20000"
         );
     }
@@ -294,8 +368,8 @@ mod tests {
                 FROM customers
             ) AS customers ON orders.customer_id = customers.customer_id;";
         assert_eq!(
-            make_deterministic(sql),
-            "SELECT orders.order_id, orders.order_amount, customers.customer_name FROM orders JOIN (SELECT customer_id, customer_name FROM customers ORDER BY 1, 2 LIMIT 20000) AS customers ON orders.customer_id = customers.customer_id ORDER BY 1, 2, 3 LIMIT 20000"
+            make_deterministic(sql, 3),
+            "SELECT orders.order_id, orders.order_amount, customers.customer_name FROM orders JOIN (SELECT customer_id, customer_name FROM customers) AS customers ON orders.customer_id = customers.customer_id ORDER BY 1, 2, 3 LIMIT 20000"
         );
     }
 
@@ -303,27 +377,27 @@ mod tests {
     fn formalize_partition() {
         let sql = "SELECT a FROM t WHERE date >= '20240101'";
         assert_eq!(
-            make_deterministic(sql),
+            make_deterministic(sql, 1),
             "SELECT a FROM t WHERE date = '20240101' ORDER BY 1 LIMIT 20000"
         );
         let sql = "SELECT a FROM t WHERE date > '20240101'";
         assert_eq!(
-            make_deterministic(sql),
+            make_deterministic(sql, 1),
             "SELECT a FROM t WHERE date = '20240101' ORDER BY 1 LIMIT 20000"
         );
         let sql = "SELECT a FROM t WHERE '20240101' <= date";
         assert_eq!(
-            make_deterministic(sql),
+            make_deterministic(sql, 1),
             "SELECT a FROM t WHERE '20240101' = date ORDER BY 1 LIMIT 20000"
         );
         let sql = "SELECT a FROM t WHERE '20240101' < date";
         assert_eq!(
-            make_deterministic(sql),
+            make_deterministic(sql, 1),
             "SELECT a FROM t WHERE '20240101' = date ORDER BY 1 LIMIT 20000"
         );
         let sql = "SELECT a FROM t WHERE name = 'Tom' AND date >= '20240101'";
         assert_eq!(
-            make_deterministic(sql),
+            make_deterministic(sql, 1),
             "SELECT a FROM t WHERE name = 'Tom' AND date = '20240101' ORDER BY 1 LIMIT 20000"
         );
     }
@@ -332,7 +406,7 @@ mod tests {
     fn array_sort() {
         let sql = "SELECT set_agg(a) FROM t";
         assert_eq!(
-            make_deterministic(sql),
+            make_deterministic(sql, 1),
             "SELECT array_sort(set_agg(a)) FROM t ORDER BY 1 LIMIT 20000"
         );
     }
