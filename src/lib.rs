@@ -2,6 +2,7 @@ use core::ops::ControlFlow;
 use sqlparser::ast::*;
 use sqlparser::dialect::AnsiDialect;
 use sqlparser::parser::Parser;
+use std::iter::zip;
 
 use pyo3::prelude::*;
 
@@ -14,8 +15,9 @@ const ARRAY_AGG_FUNCS: [&'static str; 5] = [
     "array_set",
 ];
 const ARRAY_SORT: &'static str = "array_sort";
-const FUNCTIONS_FOR_REPLACE: [&'static str; 9] = [
+const FUNCTIONS_FOR_REPLACE: [&'static str; 10] = [
     "approx_percentile",
+    "percentile_approx",
     "approx_set",
     "rand",
     "random",
@@ -67,7 +69,8 @@ fn replace_unix_timestamp(expr: &mut Expr) {
     }
     *expr = Expr::Value(Value::Number(String::from("1706514942"), false))
 }
-const REPLACE_IMPLS: [fn(&mut Expr); 9] = [
+const REPLACE_IMPLS: [fn(&mut Expr); 10] = [
+    replace_approx_percentile,
     replace_approx_percentile,
     replace_approx_set,
     replace_rand,
@@ -209,7 +212,7 @@ fn formalize_array_agg(func: &mut Function) -> bool {
     }
     let mut name_matched = false;
     ARRAY_AGG_FUNCS.into_iter().for_each(|array_agg_func| {
-        if func.name.0[0].value == array_agg_func {
+        if func.name.0[0].value.to_ascii_lowercase() == array_agg_func {
             name_matched = true;
         }
     });
@@ -296,20 +299,15 @@ impl VisitorMut for Formalizer {
                     if function.name.0.len() != 1 {
                         return ControlFlow::Continue(());
                     }
-                    let mut index = 0;
-                    loop {
-                        if index >= FUNCTIONS_FOR_REPLACE.len() {
-                            return ControlFlow::Continue(());
+                    for (function_name, replace_impl) in zip(FUNCTIONS_FOR_REPLACE, REPLACE_IMPLS) {
+                        if function.name.0[0].value.to_ascii_lowercase() == function_name {
+                            return (|| {
+                                replace_impl(_expr);
+                                ControlFlow::Continue(())
+                            })();
                         }
-                        if FUNCTIONS_FOR_REPLACE[index] == function.name.0[0].value {
-                            break;
-                        }
-                        index += 1;
                     }
-                    return (|| {
-                        REPLACE_IMPLS[index](_expr);
-                        ControlFlow::Continue(())
-                    })();
+                    return ControlFlow::Continue(());
                 }
             }
             _ => (),
@@ -546,6 +544,12 @@ mod tests {
     #[test]
     fn replace_function() {
         let sql = "SELECT approx_percentile(val) FROM t";
+        assert_eq!(
+            make_deterministic(sql, 0),
+            "SELECT percentile(val) FROM t ORDER BY 1 LIMIT 20000"
+        );
+
+        let sql = "SELECT PERCENTILE_APPROX(val) FROM t";
         assert_eq!(
             make_deterministic(sql, 0),
             "SELECT percentile(val) FROM t ORDER BY 1 LIMIT 20000"
