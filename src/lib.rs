@@ -15,9 +15,7 @@ const ARRAY_AGG_FUNCS: [&'static str; 5] = [
     "array_set",
 ];
 const ARRAY_SORT: &'static str = "array_sort";
-const FUNCTIONS_FOR_REPLACE: [&'static str; 10] = [
-    "approx_percentile",
-    "percentile_approx",
+const FUNCTIONS_FOR_REPLACE: [&'static str; 8] = [
     "approx_set",
     "rand",
     "random",
@@ -69,9 +67,7 @@ fn replace_unix_timestamp(expr: &mut Expr) {
     }
     *expr = Expr::Value(Value::Number(String::from("1706514942"), false))
 }
-const REPLACE_IMPLS: [fn(&mut Expr); 10] = [
-    replace_approx_percentile,
-    replace_approx_percentile,
+const REPLACE_IMPLS: [fn(&mut Expr); 8] = [
     replace_approx_set,
     replace_rand,
     replace_rand,
